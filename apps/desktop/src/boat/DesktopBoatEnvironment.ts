@@ -1,6 +1,7 @@
 // @effect-diagnostics nodeBuiltinImport:off - Boat VM bookkeeping is plain async I/O behind one service boundary.
 // @effect-diagnostics globalTimers:off - Keep-awake ticks outlive any single Effect fiber.
 // @effect-diagnostics globalDate:off - Port-wait deadlines run inside plain promises.
+// @effect-diagnostics globalConsole:off - Helper install runs in a child-process callback outside any fiber.
 import * as NodeChildProcess from "node:child_process";
 import * as NodeCrypto from "node:crypto";
 import * as NodeFSP from "node:fs/promises";
@@ -21,8 +22,10 @@ import * as Layer from "effect/Layer";
 import * as Schema from "effect/Schema";
 
 import * as DesktopEnvironment from "../app/DesktopEnvironment.ts";
+import * as ElectronPowerMonitor from "../electron/ElectronPowerMonitor.ts";
 import * as ElectronSafeStorage from "../electron/ElectronSafeStorage.ts";
 import { type BoatSshAccess, ensureBoatSandboxRunning, makeBoatClient } from "./boatApi.ts";
+import { boatKeepAwakeInstallScript } from "./boatKeepAwake.ts";
 import {
   BOAT_SSH_DIR_NAME,
   boatAliasForSandbox,
@@ -41,11 +44,17 @@ export const DEFAULT_BOAT_VM_DEFAULTS: DesktopBoatVmDefaults = {
   snapshot: "t3code",
   environment: "",
   size: "default",
-  idleMinutes: 60,
+  idleMinutes: 15,
 };
 
-/** Re-arms the auto-stop timer this often while an environment is connected. */
-const KEEP_AWAKE_INTERVAL_MS = 5 * 60_000;
+/** Re-arms the auto-stop timer this often while someone is at this computer. */
+const KEEP_AWAKE_INTERVAL_MS = 4 * 60_000;
+/**
+ * A stopped VM only resumes when someone has used this computer this recently.
+ * Background reconnects would otherwise wake a VM the moment it fell asleep;
+ * focusing the app retries at once, so a returning user waits only for the resume.
+ */
+const PRESENT_IDLE_SECONDS = 5 * 60;
 const SSH_PORT_WAIT_MS = 90_000;
 
 interface StoredVm {
@@ -133,6 +142,7 @@ function sshKeygen(privateKeyPath: string): Promise<void> {
 export const make = Effect.gen(function* () {
   const environment = yield* DesktopEnvironment.DesktopEnvironment;
   const safeStorage = yield* ElectronSafeStorage.ElectronSafeStorage;
+  const powerMonitor = yield* ElectronPowerMonitor.ElectronPowerMonitor;
   const statePath = NodePath.join(environment.stateDir, "boat.json");
   const sshDir = NodePath.join(environment.homeDirectory, ".ssh");
   const boatSshDir = NodePath.join(sshDir, BOAT_SSH_DIR_NAME);
@@ -164,6 +174,7 @@ export const make = Effect.gen(function* () {
   };
 
   const runEffect = <A, E>(effect: Effect.Effect<A, E>) => Effect.runPromise(effect);
+  const systemIdleSeconds = () => runEffect(powerMonitor.getSystemIdleTime);
 
   const readApiKey = async (state: StoredState): Promise<string> => {
     if (!state.encryptedApiKey) {
@@ -214,9 +225,44 @@ export const make = Effect.gen(function* () {
     return (await NodeFSP.readFile(publicKeyPath, "utf8")).trim();
   };
 
+  /** Installs the on-VM helper that keeps the VM awake while agent runs are unfinished. */
+  const installKeepAwake = (sandboxId: string, idleMinutes: number) =>
+    new Promise<void>((resolve) => {
+      const child = NodeChildProcess.spawn(
+        "ssh",
+        ["-T", "-o", "BatchMode=yes", boatAliasForSandbox(sandboxId), "bash -s"],
+        { stdio: ["pipe", "ignore", "pipe"], windowsHide: true, timeout: 120_000 },
+      );
+      let stderr = "";
+      child.stderr.on("data", (chunk: Buffer) => {
+        stderr += chunk.toString();
+      });
+      child.on("error", (error) => {
+        console.warn(`Boat keep-awake helper not installed on ${sandboxId}: ${error.message}`);
+        resolve();
+      });
+      child.on("close", (code) => {
+        // Without the helper the VM still stops on its idle timer; it just cannot outlive the app.
+        if (code !== 0) {
+          console.warn(`Boat keep-awake helper not installed on ${sandboxId}: ${stderr.trim()}`);
+        }
+        resolve();
+      });
+      child.stdin.end(boatKeepAwakeInstallScript(idleMinutes * 60));
+    });
+
   /** Starts the VM, registers our key and pins its current address and host key. */
-  const bringUp = async (sandboxId: string, idleMinutes: number, apiKey: string) => {
+  const bringUp = async (
+    sandboxId: string,
+    idleMinutes: number,
+    apiKey: string,
+    options: { readonly wake: boolean },
+  ) => {
     const client = makeBoatClient({ apiKey });
+    const current = await client.getSandbox(sandboxId);
+    if (!options.wake && (current.state === "archived" || current.state === "archiving")) {
+      throw new Error("This Boat VM is asleep to save cost. It wakes when you next use T3 Code.");
+    }
     await ensureBoatSandboxRunning(client, sandboxId, idleMinutes * 60, { timeoutMs: 10 * 60_000 });
     const ssh = await client.configureSshKey(sandboxId, await ensureIdentity());
     await updateState(async (state) => {
@@ -225,6 +271,7 @@ export const make = Effect.gen(function* () {
       return [{ ...state, vms }, undefined];
     });
     await waitForTcpPort(ssh.hostname, ssh.port, SSH_PORT_WAIT_MS);
+    await installKeepAwake(sandboxId, idleMinutes);
     return ssh;
   };
 
@@ -232,8 +279,13 @@ export const make = Effect.gen(function* () {
     if (keepAwakeTimers.has(sandboxId)) return;
     const client = makeBoatClient({ apiKey });
     const timer = setInterval(() => {
+      // Only while someone is at this computer; the VM's own helper covers running agents.
       // A missed tick only shortens the idle window; the next tick retries.
-      client.setTtl(sandboxId, idleMinutes * 60).catch(() => undefined);
+      systemIdleSeconds()
+        .then((idle) =>
+          idle < idleMinutes * 60 ? client.setTtl(sandboxId, idleMinutes * 60) : undefined,
+        )
+        .catch(() => undefined);
     }, KEEP_AWAKE_INTERVAL_MS);
     timer.unref?.();
     keepAwakeTimers.set(sandboxId, timer);
@@ -307,7 +359,7 @@ export const make = Effect.gen(function* () {
           },
           undefined,
         ]);
-        const ssh = await bringUp(sandbox.id, defaults.idleMinutes, apiKey);
+        const ssh = await bringUp(sandbox.id, defaults.idleMinutes, apiKey, { wake: true });
         return { sandboxId: sandbox.id, label, target: targetFor(sandbox.id, ssh) };
       }),
 
@@ -322,7 +374,8 @@ export const make = Effect.gen(function* () {
             throw new Error(`Boat VM ${sandboxId} is not registered on this computer.`);
           }
           const apiKey = await readApiKey(state);
-          await bringUp(sandboxId, vm.idleMinutes, apiKey);
+          const wake = (await systemIdleSeconds()) < PRESENT_IDLE_SECONDS;
+          await bringUp(sandboxId, vm.idleMinutes, apiKey, { wake });
           keepAwake(sandboxId, vm.idleMinutes, apiKey);
         });
       }),

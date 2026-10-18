@@ -238,8 +238,9 @@ export function BoatEnvironmentFields(props: {
         </label>
       </div>
       <p className="text-xs leading-relaxed text-muted-foreground">
-        T3 Code keeps the VM awake while this app is connected to it. It stops on its own once the
-        app has been closed or disconnected for the idle time, and resumes when you reconnect.
+        The VM stays on while an agent is working on it, even with this app closed, and while you
+        are at this computer. Once both stop for the idle time it shuts down to save cost, and it
+        wakes again in a few seconds when you next use it.
       </p>
       {shownError ? (
         <Alert variant="error">
