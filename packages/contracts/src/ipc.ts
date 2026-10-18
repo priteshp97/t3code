@@ -4,6 +4,7 @@ import type {
   DesktopBoatSettings,
   DesktopBoatSettingsUpdate,
   DesktopBoatVm,
+  DesktopBoatWakeVmInput,
 } from "./desktopBoat.ts";
 import * as Schema from "effect/Schema";
 
@@ -1097,6 +1098,7 @@ export interface DesktopBridge {
   updateBoatSettings?: (update: DesktopBoatSettingsUpdate) => Promise<DesktopBoatSettings>;
   createBoatVm?: (input: DesktopBoatCreateVmInput) => Promise<DesktopBoatVm>;
   removeBoatVm?: (input: DesktopBoatRemoveVmInput) => Promise<void>;
+  wakeBoatVm?: (input: DesktopBoatWakeVmInput) => Promise<void>;
   getServerExposureState: () => Promise<DesktopServerExposureState>;
   setServerExposureMode: (mode: DesktopServerExposureMode) => Promise<DesktopServerExposureState>;
   setTailscaleServeEnabled: (input: {

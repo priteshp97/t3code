@@ -68,6 +68,7 @@ export const GET_BOAT_SETTINGS_CHANNEL = "desktop:get-boat-settings";
 export const UPDATE_BOAT_SETTINGS_CHANNEL = "desktop:update-boat-settings";
 export const CREATE_BOAT_VM_CHANNEL = "desktop:create-boat-vm";
 export const REMOVE_BOAT_VM_CHANNEL = "desktop:remove-boat-vm";
+export const WAKE_BOAT_VM_CHANNEL = "desktop:wake-boat-vm";
 export const GET_SERVER_EXPOSURE_STATE_CHANNEL = "desktop:get-server-exposure-state";
 export const SET_SERVER_EXPOSURE_MODE_CHANNEL = "desktop:set-server-exposure-mode";
 export const SET_TAILSCALE_SERVE_ENABLED_CHANNEL = "desktop:set-tailscale-serve-enabled";

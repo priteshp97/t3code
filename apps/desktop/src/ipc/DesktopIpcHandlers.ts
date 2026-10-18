@@ -35,6 +35,7 @@ import {
   getBoatSettings,
   removeBoatVm,
   updateBoatSettings,
+  wakeBoatVm,
 } from "./methods/boatEnvironment.ts";
 import {
   checkForUpdate,
@@ -138,6 +139,7 @@ export const installDesktopIpcHandlers = Effect.fn("desktop.ipc.installHandlers"
   yield* ipc.handle(updateBoatSettings);
   yield* ipc.handle(createBoatVm);
   yield* ipc.handle(removeBoatVm);
+  yield* ipc.handle(wakeBoatVm);
 
   yield* ipc.handle(getServerExposureState);
   yield* ipc.handle(setServerExposureMode);

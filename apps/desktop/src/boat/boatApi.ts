@@ -243,8 +243,8 @@ const defaultSleep = (ms: number, signal?: AbortSignal) =>
 
 /**
  * Brings a sandbox to a running state: waits out an in-flight archive (a stop
- * timer may be firing right now), resumes an archived sandbox, and otherwise
- * refreshes its auto-stop timer.
+ * timer may be firing right now) and resumes an archived sandbox with a fresh
+ * auto-stop timer. A running sandbox's timer is left to the helper on the VM.
  */
 export async function ensureBoatSandboxRunning(
   client: BoatClient,
@@ -260,7 +260,6 @@ export async function ensureBoatSandboxRunning(
     options.signal?.throwIfAborted();
     const sandbox = await client.getSandbox(sandboxId, options.signal);
     if (isBoatSandboxRunning(sandbox.state)) {
-      if (!resumed) await client.setTtl(sandboxId, ttlSeconds, options.signal);
       return sandbox;
     }
     if (sandbox.state === "error" || sandbox.state === "cancelled") {

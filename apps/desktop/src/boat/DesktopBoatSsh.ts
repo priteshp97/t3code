@@ -45,10 +45,7 @@ export const withBoat = <E, R>(
                 : { ...bootstrap, target: stableBoatTarget(bootstrap.target) },
             ),
           ),
-        disconnectEnvironment: (target) =>
-          ssh
-            .disconnectEnvironment(stableBoatTarget(target))
-            .pipe(Effect.ensuring(boat.releaseTarget(target))),
+        disconnectEnvironment: (target) => ssh.disconnectEnvironment(stableBoatTarget(target)),
       });
     }),
   ).pipe(Layer.provide(inner));

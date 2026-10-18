@@ -1,4 +1,5 @@
 import { ThreadFind, ThreadFindCanvas, type ThreadFindControls } from "./chat/ThreadFindProvider";
+import { wakeBoatVmFor } from "./settings/BoatEnvironmentFields";
 import { THREAD_FIND_BAR_RESERVED_HEIGHT } from "./chat/ThreadFindBar";
 import { usageLimitRecoveryBannerItem } from "./chat/UsageLimitRecoveryBanner";
 import {
@@ -1990,6 +1991,8 @@ export default function ChatView(props: ChatViewProps) {
     };
   })() as EnvironmentUnavailableState | null;
   const handleReconnectActiveEnvironment = async (environmentId: EnvironmentId) => {
+    const environment = environmentById.get(environmentId);
+    if (environment) await wakeBoatVmFor(environment).catch(() => undefined);
     const result = await retryEnvironment(environmentId);
     if (result._tag === "Failure" && !isAtomCommandInterrupted(result)) {
       const error = squashAtomCommandFailure(result);

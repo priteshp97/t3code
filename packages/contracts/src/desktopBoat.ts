@@ -47,6 +47,11 @@ export const DesktopBoatVmSchema = Schema.Struct({
 });
 export type DesktopBoatVm = typeof DesktopBoatVmSchema.Type;
 
+export const DesktopBoatWakeVmInputSchema = Schema.Struct({
+  target: DesktopSshEnvironmentTargetSchema,
+});
+export type DesktopBoatWakeVmInput = typeof DesktopBoatWakeVmInputSchema.Type;
+
 export const DesktopBoatRemoveVmInputSchema = Schema.Struct({
   target: DesktopSshEnvironmentTargetSchema,
   stop: Schema.Boolean,

@@ -4,6 +4,7 @@ import {
   DesktopBoatSettingsSchema,
   DesktopBoatSettingsUpdateSchema,
   DesktopBoatVmSchema,
+  DesktopBoatWakeVmInputSchema,
 } from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
 import * as Schema from "effect/Schema";
@@ -49,5 +50,15 @@ export const removeBoatVm = DesktopIpc.makeIpcMethod({
   handler: Effect.fn("desktop.ipc.boat.removeVm")(function* ({ target, stop }) {
     const boat = yield* DesktopBoatEnvironment.DesktopBoatEnvironment;
     yield* boat.removeVm(target, { stop });
+  }),
+});
+
+export const wakeBoatVm = DesktopIpc.makeIpcMethod({
+  channel: IpcChannels.WAKE_BOAT_VM_CHANNEL,
+  payload: DesktopBoatWakeVmInputSchema,
+  result: Schema.Void,
+  handler: Effect.fn("desktop.ipc.boat.wakeVm")(function* ({ target }) {
+    const boat = yield* DesktopBoatEnvironment.DesktopBoatEnvironment;
+    yield* boat.wakeVm(target);
   }),
 });

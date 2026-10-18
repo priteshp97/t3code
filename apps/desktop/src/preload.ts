@@ -178,6 +178,7 @@ contextBridge.exposeInMainWorld("desktopBridge", {
     ipcRenderer.invoke(IpcChannels.UPDATE_BOAT_SETTINGS_CHANNEL, update),
   createBoatVm: (input) => ipcRenderer.invoke(IpcChannels.CREATE_BOAT_VM_CHANNEL, input),
   removeBoatVm: (input) => ipcRenderer.invoke(IpcChannels.REMOVE_BOAT_VM_CHANNEL, input),
+  wakeBoatVm: (input) => ipcRenderer.invoke(IpcChannels.WAKE_BOAT_VM_CHANNEL, input),
   getServerExposureState: () => ipcRenderer.invoke(IpcChannels.GET_SERVER_EXPOSURE_STATE_CHANNEL),
   setServerExposureMode: (mode) =>
     ipcRenderer.invoke(IpcChannels.SET_SERVER_EXPOSURE_MODE_CHANNEL, mode),

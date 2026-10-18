@@ -35,7 +35,7 @@ function run(target: DesktopSshEnvironmentTarget) {
       Effect.sync(() => {
         prepared.push(requested.alias);
       }),
-    releaseTarget: () => Effect.void,
+    wakeVm: () => Effect.void,
     removeVm: () => Effect.void,
   });
   const layer = withBoat(inner).pipe(Layer.provide(boat));

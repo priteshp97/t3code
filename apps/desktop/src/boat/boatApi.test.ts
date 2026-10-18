@@ -74,14 +74,10 @@ describe("ensureBoatSandboxRunning", () => {
     ]);
   });
 
-  it("re-arms the auto-stop timer of a VM that is already running", async () => {
+  it("leaves the auto-stop timer of a running VM to the VM", async () => {
     const { calls, client } = fakeBoat(["running"]);
     await ensureBoatSandboxRunning(client, "bx_abcd2345", 900, { sleep: noSleep });
-    expect(calls.at(-1)).toEqual({
-      method: "PATCH",
-      path: "/sandboxes/bx_abcd2345",
-      body: { ttlSeconds: 900 },
-    });
+    expect(calls.filter((call) => call.method !== "GET")).toEqual([]);
   });
 
   it("fails on a VM Boat could not place", async () => {

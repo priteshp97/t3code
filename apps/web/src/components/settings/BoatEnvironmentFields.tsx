@@ -36,6 +36,13 @@ export function boatSshTargetOf(
   return profile.target.alias.startsWith("t3-boat-bx_") ? profile.target : null;
 }
 
+/** Lets a sleeping Boat VM resume on the next connect; a no-op for other environments. */
+export async function wakeBoatVmFor(environment: EnvironmentPresentation): Promise<void> {
+  const target = boatSshTargetOf(environment);
+  if (target === null) return;
+  await window.desktopBridge?.wakeBoatVm?.({ target });
+}
+
 /** Stops the VM behind a removed environment. Boat deletes a stopped VM's disk after 14 days. */
 export async function stopBoatVmFor(environment: EnvironmentPresentation): Promise<void> {
   const target = boatSshTargetOf(environment);
@@ -238,9 +245,9 @@ export function BoatEnvironmentFields(props: {
         </label>
       </div>
       <p className="text-xs leading-relaxed text-muted-foreground">
-        The VM stays on while an agent is working on it, even with this app closed, and while you
-        are at this computer. Once both stop for the idle time it shuts down to save cost, and it
-        wakes again in a few seconds when you next use it.
+        The VM stays on while an agent is working on it, even with this app closed, and shuts down
+        once agents have been idle this long. To wake it, open one of its threads and choose
+        Reconnect.
       </p>
       {shownError ? (
         <Alert variant="error">

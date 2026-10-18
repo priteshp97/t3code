@@ -1,5 +1,5 @@
 // @effect-diagnostics nodeBuiltinImport:off - Boat VM bookkeeping is plain async I/O behind one service boundary.
-// @effect-diagnostics globalTimers:off - Keep-awake ticks outlive any single Effect fiber.
+// @effect-diagnostics globalTimers:off - Port-wait retries run inside plain promises.
 // @effect-diagnostics globalDate:off - Port-wait deadlines run inside plain promises.
 // @effect-diagnostics globalConsole:off - Helper install runs in a child-process callback outside any fiber.
 import * as NodeChildProcess from "node:child_process";
@@ -16,13 +16,13 @@ import type {
   DesktopBoatVmDefaults,
   DesktopSshEnvironmentTarget,
 } from "@t3tools/contracts";
+import * as Clock from "effect/Clock";
 import * as Context from "effect/Context";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as Schema from "effect/Schema";
 
 import * as DesktopEnvironment from "../app/DesktopEnvironment.ts";
-import * as ElectronPowerMonitor from "../electron/ElectronPowerMonitor.ts";
 import * as ElectronSafeStorage from "../electron/ElectronSafeStorage.ts";
 import { type BoatSshAccess, ensureBoatSandboxRunning, makeBoatClient } from "./boatApi.ts";
 import { boatKeepAwakeInstallScript } from "./boatKeepAwake.ts";
@@ -47,14 +47,12 @@ export const DEFAULT_BOAT_VM_DEFAULTS: DesktopBoatVmDefaults = {
   idleMinutes: 15,
 };
 
-/** Re-arms the auto-stop timer this often while someone is at this computer. */
-const KEEP_AWAKE_INTERVAL_MS = 4 * 60_000;
 /**
- * A stopped VM only resumes when someone has used this computer this recently.
- * Background reconnects would otherwise wake a VM the moment it fell asleep;
- * focusing the app retries at once, so a returning user waits only for the resume.
+ * A sleeping VM resumes only after the user asks for it (Reconnect on one of its
+ * threads). Background reconnects would otherwise wake it the moment it slept.
+ * The grant outlives one connect attempt so the supervisor's retries can use it.
  */
-const PRESENT_IDLE_SECONDS = 5 * 60;
+const WAKE_GRANT_MS = 3 * 60_000;
 const SSH_PORT_WAIT_MS = 90_000;
 
 interface StoredVm {
@@ -84,7 +82,8 @@ export class DesktopBoatEnvironment extends Context.Service<
     readonly prepareTarget: (
       target: DesktopSshEnvironmentTarget,
     ) => Effect.Effect<void, DesktopBoatEnvironmentError>;
-    readonly releaseTarget: (target: DesktopSshEnvironmentTarget) => Effect.Effect<void>;
+    /** Lets the next connects resume this VM if it is asleep. */
+    readonly wakeVm: (target: DesktopSshEnvironmentTarget) => Effect.Effect<void>;
     readonly removeVm: (
       target: DesktopSshEnvironmentTarget,
       options: { readonly stop: boolean },
@@ -142,12 +141,11 @@ function sshKeygen(privateKeyPath: string): Promise<void> {
 export const make = Effect.gen(function* () {
   const environment = yield* DesktopEnvironment.DesktopEnvironment;
   const safeStorage = yield* ElectronSafeStorage.ElectronSafeStorage;
-  const powerMonitor = yield* ElectronPowerMonitor.ElectronPowerMonitor;
   const statePath = NodePath.join(environment.stateDir, "boat.json");
   const sshDir = NodePath.join(environment.homeDirectory, ".ssh");
   const boatSshDir = NodePath.join(sshDir, BOAT_SSH_DIR_NAME);
   const identityPath = NodePath.join(boatSshDir, "id_ed25519");
-  const keepAwakeTimers = new Map<string, ReturnType<typeof setInterval>>();
+  const wakeGrants = new Map<string, number>();
   let stateLock: Promise<unknown> = Promise.resolve();
 
   const readState = async (): Promise<StoredState> => {
@@ -174,7 +172,6 @@ export const make = Effect.gen(function* () {
   };
 
   const runEffect = <A, E>(effect: Effect.Effect<A, E>) => Effect.runPromise(effect);
-  const systemIdleSeconds = () => runEffect(powerMonitor.getSystemIdleTime);
 
   const readApiKey = async (state: StoredState): Promise<string> => {
     if (!state.encryptedApiKey) {
@@ -261,7 +258,9 @@ export const make = Effect.gen(function* () {
     const client = makeBoatClient({ apiKey });
     const current = await client.getSandbox(sandboxId);
     if (!options.wake && (current.state === "archived" || current.state === "archiving")) {
-      throw new Error("This Boat VM is asleep to save cost. It wakes when you next use T3 Code.");
+      throw new Error(
+        "This Boat VM is asleep to save cost. Open one of its threads and choose Reconnect to wake it.",
+      );
     }
     await ensureBoatSandboxRunning(client, sandboxId, idleMinutes * 60, { timeoutMs: 10 * 60_000 });
     const ssh = await client.configureSshKey(sandboxId, await ensureIdentity());
@@ -273,28 +272,6 @@ export const make = Effect.gen(function* () {
     await waitForTcpPort(ssh.hostname, ssh.port, SSH_PORT_WAIT_MS);
     await installKeepAwake(sandboxId, idleMinutes);
     return ssh;
-  };
-
-  const keepAwake = (sandboxId: string, idleMinutes: number, apiKey: string) => {
-    if (keepAwakeTimers.has(sandboxId)) return;
-    const client = makeBoatClient({ apiKey });
-    const timer = setInterval(() => {
-      // Only while someone is at this computer; the VM's own helper covers running agents.
-      // A missed tick only shortens the idle window; the next tick retries.
-      systemIdleSeconds()
-        .then((idle) =>
-          idle < idleMinutes * 60 ? client.setTtl(sandboxId, idleMinutes * 60) : undefined,
-        )
-        .catch(() => undefined);
-    }, KEEP_AWAKE_INTERVAL_MS);
-    timer.unref?.();
-    keepAwakeTimers.set(sandboxId, timer);
-  };
-
-  const stopKeepAwake = (sandboxId: string) => {
-    const timer = keepAwakeTimers.get(sandboxId);
-    if (timer !== undefined) clearInterval(timer);
-    keepAwakeTimers.delete(sandboxId);
   };
 
   const targetFor = (sandboxId: string, ssh: BoatSshAccess): DesktopSshEnvironmentTarget => {
@@ -374,16 +351,17 @@ export const make = Effect.gen(function* () {
             throw new Error(`Boat VM ${sandboxId} is not registered on this computer.`);
           }
           const apiKey = await readApiKey(state);
-          const wake = (await systemIdleSeconds()) < PRESENT_IDLE_SECONDS;
+          const wake = (wakeGrants.get(sandboxId) ?? 0) > Date.now();
           await bringUp(sandboxId, vm.idleMinutes, apiKey, { wake });
-          keepAwake(sandboxId, vm.idleMinutes, apiKey);
+          wakeGrants.delete(sandboxId);
         });
       }),
 
-    releaseTarget: (target) =>
-      Effect.sync(() => {
+    wakeVm: (target) =>
+      Effect.gen(function* () {
         const sandboxId = boatSandboxIdFromAlias(target.alias);
-        if (sandboxId !== null) stopKeepAwake(sandboxId);
+        if (sandboxId === null) return;
+        wakeGrants.set(sandboxId, (yield* Clock.currentTimeMillis) + WAKE_GRANT_MS);
       }),
 
     removeVm: (target, options) =>
@@ -391,7 +369,7 @@ export const make = Effect.gen(function* () {
         const sandboxId = boatSandboxIdFromAlias(target.alias);
         if (sandboxId === null) return Effect.void;
         return run("removeVm", async () => {
-          stopKeepAwake(sandboxId);
+          wakeGrants.delete(sandboxId);
           const state = await readState();
           if (options.stop) {
             const client = makeBoatClient({ apiKey: await readApiKey(state) });
