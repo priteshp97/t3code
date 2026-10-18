@@ -1,0 +1,724 @@
+name: Fork nightly
+
+# Daily build of the Boat fork: the newest upstream T3 Code nightly tag plus the
+# fork's patch commits from `boat`, published as a prerelease of this fork so
+# the fork's Windows desktop app (electron-updater, nightly channel) and its
+# `t3` CLI installs update from here. See fork/README.md.
+#
+# Nothing is pushed: GITHUB_TOKEN may not push commits that touch workflows,
+# and every upstream commit does. `prepare` composes the tree once, tests it,
+# and hands the build jobs a single binary diff against the upstream tag plus
+# the expected tree hash, which each job re-applies and verifies.
+
+on:
+  schedule:
+    - cron: "30 5 * * *"
+  workflow_dispatch:
+    inputs:
+      upstream_tag:
+        description: "Upstream nightly tag to build (for example v0.1.1-nightly.20261018.3331). Defaults to the newest."
+        required: false
+        type: string
+      force:
+        description: "Build even when a fork release already exists for this upstream tag and patch."
+        required: false
+        default: false
+        type: boolean
+
+concurrency:
+  group: fork-nightly
+  cancel-in-progress: false
+
+permissions: {}
+
+env:
+  PATCH_BRANCH: boat
+  UPSTREAM_URL: https://github.com/pingdotgg/t3code.git
+  GIT_TERMINAL_PROMPT: "0"
+
+jobs:
+  prepare:
+    name: Compose upstream nightly + Boat patch
+    if: github.repository == 'priteshp97/t3code'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    permissions:
+      contents: read
+    outputs:
+      status: ${{ steps.compose.outputs.status }}
+      conflict_report: ${{ steps.compose.outputs.conflict_report }}
+      upstream_tag: ${{ steps.compose.outputs.upstream_tag }}
+      upstream_sha: ${{ steps.compose.outputs.upstream_sha }}
+      patch_sha: ${{ steps.fetch.outputs.patch_sha }}
+      patch_hash: ${{ steps.compose.outputs.patch_hash }}
+      version: ${{ steps.compose.outputs.version }}
+      tree: ${{ steps.export.outputs.tree }}
+      clerk_publishable_key: ${{ steps.public_config.outputs.clerk_publishable_key }}
+      clerk_jwt_template: ${{ steps.public_config.outputs.clerk_jwt_template }}
+      clerk_cli_oauth_client_id: ${{ steps.public_config.outputs.clerk_cli_oauth_client_id }}
+      relay_url: ${{ steps.public_config.outputs.relay_url }}
+    steps:
+      # Blobless fetches: the patch range needs upstream's full commit graph,
+      # not its file history. Blobs are fetched on demand by checkout.
+      - id: fetch
+        name: Fetch Boat branch and upstream history
+        shell: bash
+        run: |
+          set -euo pipefail
+          git init -q .
+          git remote add origin "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}.git"
+          git fetch --quiet --filter=blob:none --no-tags origin \
+            "+refs/heads/${PATCH_BRANCH}:refs/remotes/origin/${PATCH_BRANCH}"
+          git sparse-checkout set --no-cone '/*' '!/.repos/'
+          git show "refs/remotes/origin/${PATCH_BRANCH}:fork/compose.sh" > "$RUNNER_TEMP/compose.sh"
+          chmod +x "$RUNNER_TEMP/compose.sh"
+          "$RUNNER_TEMP/compose.sh" fetch-upstream
+          echo "patch_sha=$(git rev-parse "refs/remotes/origin/${PATCH_BRANCH}")" >> "$GITHUB_OUTPUT"
+
+      - id: compose
+        name: Compose build tree
+        shell: bash
+        env:
+          INPUT_TAG: ${{ inputs.upstream_tag }}
+          FORCE: ${{ inputs.force }}
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          compose="$RUNNER_TEMP/compose.sh"
+          patch_ref="refs/remotes/origin/${PATCH_BRANCH}"
+          out="$RUNNER_TEMP/fork-compose"
+          mkdir -p "$out"
+
+          if [[ -n "${INPUT_TAG:-}" ]]; then
+            tag="$INPUT_TAG"
+          else
+            tag="$("$compose" latest-tag)"
+          fi
+          upstream_sha="$(git rev-parse --verify "refs/upstream-tags/${tag}^{commit}")"
+          {
+            echo "upstream_tag=$tag"
+            echo "upstream_sha=$upstream_sha"
+          } >> "$GITHUB_OUTPUT"
+          "$compose" patch-commits "$patch_ref" "$tag" > "$out/patch-commits.txt"
+          echo "Upstream $tag ($upstream_sha); patch commits:"
+          cat "$out/patch-commits.txt"
+
+          rc=0
+          "$compose" compose "$tag" "$patch_ref" "$RUNNER_TEMP/conflict.md" || rc=$?
+          if [[ "$rc" == 3 ]]; then
+            cat "$RUNNER_TEMP/conflict.md"
+            delimiter="EOF_$(openssl rand -hex 8)"
+            {
+              echo "status=conflict"
+              echo "conflict_report<<$delimiter"
+              cat "$RUNNER_TEMP/conflict.md"
+              echo "$delimiter"
+            } >> "$GITHUB_OUTPUT"
+            exit 0
+          elif [[ "$rc" != 0 ]]; then
+            exit "$rc"
+          fi
+
+          patch_hash="$("$compose" patch-hash)"
+          echo "patch_hash=$patch_hash" >> "$GITHUB_OUTPUT"
+
+          # Every fork release for this upstream tag is v<base>-nightly.<date>.<run><NN>.
+          gh release list --limit 1000 --json tagName --jq '.[].tagName' > "$RUNNER_TEMP/fork-tags.txt"
+          n="$("$compose" next-n "$tag" < "$RUNNER_TEMP/fork-tags.txt")"
+          if (( n > 1 )) && [[ "${FORCE:-false}" != "true" ]]; then
+            previous="v$("$compose" fork-version "$tag" $((n - 1)))"
+            previous_hash="$(gh release view "$previous" --json body --jq .body \
+              | sed -n 's/.*fork-patch-hash: \([0-9a-f]\{40,64\}\).*/\1/p' | head -n 1)"
+            if [[ "$previous_hash" == "$patch_hash" ]]; then
+              echo "::notice::$previous already ships $tag with patch $patch_hash; nothing to build."
+              echo "status=skip" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+          fi
+          version="$("$compose" fork-version "$tag" "$n")"
+          echo "Fork version: $version"
+          {
+            echo "version=$version"
+            echo "status=build"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Setup Vite+
+        if: steps.compose.outputs.status == 'build'
+        uses: voidzero-dev/setup-vp@250f29ce396baf5e8f24498e17c0dfdebabc26eb # v1
+        with:
+          node-version-file: package.json
+          cache: true
+          run-install: false
+
+      - name: Verify fork version against the nightly patterns
+        if: steps.compose.outputs.status == 'build'
+        shell: bash
+        env:
+          VERSION: ${{ steps.compose.outputs.version }}
+        run: '"$RUNNER_TEMP/compose.sh" verify-version "$VERSION"'
+
+      # The public T3 Connect identifiers upstream commits in .env.example (the
+      # same values official builds bake in). Read from the composed tree so the
+      # fork follows upstream if they change; anything unexpected fails here.
+      - id: public_config
+        name: Resolve T3 Connect public config
+        if: steps.compose.outputs.status == 'build'
+        shell: bash
+        run: |
+          set -euo pipefail
+          read_public() {
+            sed -n "s/^$1=//p" .env.example | tr -d '\r' | tail -n 1
+          }
+          require() {
+            if [[ ! "$2" =~ $3 ]]; then
+              echo "::error::.env.example $1 is missing or unexpected: '$2'" >&2
+              exit 1
+            fi
+          }
+          key="$(read_public T3CODE_CLERK_PUBLISHABLE_KEY)"
+          template="$(read_public T3CODE_CLERK_JWT_TEMPLATE)"
+          client_id="$(read_public T3CODE_CLERK_CLI_OAUTH_CLIENT_ID)"
+          relay_url="$(read_public T3CODE_RELAY_URL)"
+          require T3CODE_CLERK_PUBLISHABLE_KEY "$key" '^pk_live_[A-Za-z0-9+/=]+$'
+          require T3CODE_CLERK_JWT_TEMPLATE "$template" '^[A-Za-z0-9_-]+$'
+          require T3CODE_CLERK_CLI_OAUTH_CLIENT_ID "$client_id" '^[A-Za-z0-9_-]+$'
+          require T3CODE_RELAY_URL "$relay_url" '^https://[A-Za-z0-9.-]+$'
+          {
+            echo "clerk_publishable_key=$key"
+            echo "clerk_jwt_template=$template"
+            echo "clerk_cli_oauth_client_id=$client_id"
+            echo "relay_url=$relay_url"
+          } >> "$GITHUB_OUTPUT"
+
+      - id: export
+        name: Rebrand and export the composed tree
+        if: steps.compose.outputs.status == 'build'
+        shell: bash
+        env:
+          UPSTREAM_TAG: ${{ steps.compose.outputs.upstream_tag }}
+          UPSTREAM_SHA: ${{ steps.compose.outputs.upstream_sha }}
+          PATCH_SHA: ${{ steps.fetch.outputs.patch_sha }}
+          PATCH_HASH: ${{ steps.compose.outputs.patch_hash }}
+          VERSION: ${{ steps.compose.outputs.version }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          compose="$RUNNER_TEMP/compose.sh"
+          out="$RUNNER_TEMP/fork-compose"
+          "$compose" rebrand "$GITHUB_REPOSITORY"
+          tree="$("$compose" export "$UPSTREAM_TAG" "$out/composed.patch")"
+          cp "$compose" "$out/compose.sh"
+          echo "tree=$tree" >> "$GITHUB_OUTPUT"
+
+          {
+            echo "Boat fork build of T3 Code $VERSION: upstream nightly \`$UPSTREAM_TAG\` with the fork's patch commits cherry-picked on top."
+            echo
+            echo "| | |"
+            echo "|---|---|"
+            echo "| Upstream tag | [\`$UPSTREAM_TAG\`](https://github.com/pingdotgg/t3code/releases/tag/$UPSTREAM_TAG) |"
+            echo "| Upstream commit | [\`$UPSTREAM_SHA\`](https://github.com/pingdotgg/t3code/commit/$UPSTREAM_SHA) |"
+            echo "| Fork branch | \`$PATCH_BRANCH\` at \`$PATCH_SHA\` |"
+            echo "| Patch tree hash | \`$PATCH_HASH\` |"
+            echo "| Built tree | \`$tree\` |"
+            echo "| Workflow run | $RUN_URL |"
+            echo
+            echo "Patch commits:"
+            echo
+            while read -r sha; do
+              echo "- \`$sha\` $(git log -1 --format=%s "$sha")"
+            done < "$out/patch-commits.txt"
+            echo
+            echo "The tag points at the \`$PATCH_BRANCH\` commit above; the built tree itself is not pushed. CLI downloads are pointed at \`$GITHUB_REPOSITORY\`. Builds are not code-signed."
+            echo
+            echo "<!-- fork-upstream-tag: $UPSTREAM_TAG -->"
+            echo "<!-- fork-upstream-sha: $UPSTREAM_SHA -->"
+            echo "<!-- fork-patch-hash: $PATCH_HASH -->"
+          } > "$out/notes.md"
+          cat "$out/notes.md"
+
+      # Scans every commit on top of the upstream tag (the patch commits and the
+      # rebrand) and fails on any finding.
+      - name: Scan the fork patch for secrets
+        if: steps.compose.outputs.status == 'build'
+        shell: bash
+        env:
+          GITLEAKS_VERSION: 8.30.1
+          GITLEAKS_SHA256: 551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb
+          UPSTREAM_SHA: ${{ steps.compose.outputs.upstream_sha }}
+        run: |
+          set -euo pipefail
+          archive="$RUNNER_TEMP/gitleaks.tar.gz"
+          curl -fsSL -o "$archive" \
+            "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
+          echo "${GITLEAKS_SHA256}  ${archive}" | sha256sum -c -
+          tar -xzf "$archive" -C "$RUNNER_TEMP" gitleaks
+          "$RUNNER_TEMP/gitleaks" git --no-banner --redact --exit-code 1 \
+            --log-opts="${UPSTREAM_SHA}..HEAD" .
+
+      - name: Install dependencies
+        if: steps.compose.outputs.status == 'build'
+        run: vp install --filter=@t3tools/desktop... --filter=@t3tools/web... --filter=@t3tools/contracts...
+
+      - name: Ensure Electron runtime is installed
+        if: steps.compose.outputs.status == 'build'
+        run: vp run --filter @t3tools/desktop ensure:electron
+
+      - name: Typecheck desktop, web and contracts
+        if: steps.compose.outputs.status == 'build'
+        run: vp run --filter @t3tools/contracts --filter @t3tools/desktop --filter @t3tools/web typecheck
+
+      - name: Test Boat environments
+        if: steps.compose.outputs.status == 'build'
+        run: vp test run apps/desktop/src/boat
+
+      - name: Upload composed tree
+        if: steps.compose.outputs.status == 'build'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: fork-compose
+          path: ${{ runner.temp }}/fork-compose/*
+          if-no-files-found: error
+          retention-days: 7
+
+  conflict:
+    name: Report rebase conflict
+    needs: prepare
+    if: needs.prepare.outputs.status == 'conflict'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      issues: write
+    steps:
+      - name: Open or update the conflict issue
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          UPSTREAM_TAG: ${{ needs.prepare.outputs.upstream_tag }}
+          REPORT: ${{ needs.prepare.outputs.conflict_report }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          title="Nightly rebase conflict: $UPSTREAM_TAG"
+          body="$RUNNER_TEMP/issue.md"
+          {
+            echo "The fork's patch commits on \`$PATCH_BRANCH\` no longer apply to upstream \`$UPSTREAM_TAG\`, so no fork nightly was published."
+            echo
+            echo "$REPORT"
+            echo
+            echo "Workflow run: $RUN_URL"
+            echo
+            echo "To fix: rebase \`$PATCH_BRANCH\` onto \`$UPSTREAM_TAG\`, run the tests, push \`$PATCH_BRANCH\`, then re-run the Fork nightly workflow. See fork/README.md."
+          } > "$body"
+          cat "$body" >> "$GITHUB_STEP_SUMMARY"
+
+          existing="$(gh issue list --state open --limit 100 --json number,title \
+            --jq '[.[] | select(.title | startswith("Nightly rebase conflict:"))][0].number // empty')"
+          if [[ -n "$existing" ]]; then
+            gh issue edit "$existing" --title "$title"
+            gh issue comment "$existing" --body-file "$body"
+            echo "Updated issue #$existing."
+          else
+            gh issue create --title "$title" --body-file "$body"
+          fi
+          echo "::error::$title"
+          exit 1
+
+  linux_cli:
+    name: Build Linux x64 CLI
+    needs: prepare
+    if: needs.prepare.outputs.status == 'build'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    env:
+      VERSION: ${{ needs.prepare.outputs.version }}
+      T3CODE_CLERK_PUBLISHABLE_KEY: ${{ needs.prepare.outputs.clerk_publishable_key }}
+      T3CODE_CLERK_JWT_TEMPLATE: ${{ needs.prepare.outputs.clerk_jwt_template }}
+      T3CODE_CLERK_CLI_OAUTH_CLIENT_ID: ${{ needs.prepare.outputs.clerk_cli_oauth_client_id }}
+      T3CODE_RELAY_URL: ${{ needs.prepare.outputs.relay_url }}
+    steps:
+      - name: Download composed tree
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: fork-compose
+          path: ${{ runner.temp }}/fork-compose
+
+      - name: Check out composed tree
+        shell: bash
+        env:
+          UPSTREAM_SHA: ${{ needs.prepare.outputs.upstream_sha }}
+          TREE: ${{ needs.prepare.outputs.tree }}
+        run: |
+          set -euo pipefail
+          git init -q .
+          git remote add upstream "$UPSTREAM_URL"
+          git fetch --quiet --no-tags --depth=1 upstream "$UPSTREAM_SHA"
+          git sparse-checkout set --no-cone '/*' '!/.repos/'
+          git -c checkout.workers=0 -c advice.detachedHead=false checkout --detach FETCH_HEAD
+          bash "$RUNNER_TEMP/fork-compose/compose.sh" apply "$UPSTREAM_SHA" "$RUNNER_TEMP/fork-compose/composed.patch" "$TREE"
+
+      - name: Setup Vite+
+        uses: voidzero-dev/setup-vp@250f29ce396baf5e8f24498e17c0dfdebabc26eb # v1
+        with:
+          node-version-file: package.json
+          cache: true
+          run-install: false
+
+      # @t3tools/desktop#build compiles the Linux browser secret helper on a
+      # Linux host before packing, and that needs libsecret headers.
+      - name: Install browser secret helper build libraries
+        run: sudo apt-get update && sudo apt-get install -y libsecret-1-dev pkg-config
+
+      - name: Install dependencies
+        run: vp install --filter=t3... --filter=@t3tools/web... --filter=@t3tools/desktop... --filter=@t3tools/scripts...
+
+      - name: Align package versions to release version
+        run: node scripts/update-release-package-versions.ts "$VERSION"
+
+      # Same as upstream's build_bundle: the server bundle with the web client
+      # (apps/server/dist) and the Electron main (apps/desktop/dist-electron),
+      # with the T3 Connect values baked in. The Windows job packages it.
+      - name: Build JS bundle
+        run: vp run build:desktop
+
+      - name: Upload JS bundle
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: js-bundle
+          path: |
+            apps/server/dist
+            apps/desktop/dist-electron
+          if-no-files-found: error
+          retention-days: 1
+
+      - name: Cache resource monitor
+        id: resource_monitor_cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+        with:
+          path: native/resource-monitor/target/x86_64-unknown-linux-gnu/release/t3-resource-monitor
+          key: resource-monitor-x86_64-unknown-linux-gnu-${{ hashFiles('native/resource-monitor/Cargo.lock', 'native/resource-monitor/Cargo.toml', 'native/resource-monitor/src/**') }}
+
+      - name: Setup Rust
+        if: steps.resource_monitor_cache.outputs.cache-hit != 'true'
+        uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+        with:
+          toolchain: stable
+          targets: x86_64-unknown-linux-gnu
+
+      # The command scripts/build-desktop-artifact.ts runs for the desktop app.
+      - name: Build resource monitor
+        if: steps.resource_monitor_cache.outputs.cache-hit != 'true'
+        run: cargo build --locked --release --manifest-path native/resource-monitor/Cargo.toml --target x86_64-unknown-linux-gnu
+
+      # Upstream pins VP_NODE_VERSION to SEA_NODE_VERSION in
+      # apps/server/vite.config.ts by hand; read it so the two cannot drift.
+      - name: Build CLI single-executable
+        shell: bash
+        run: |
+          set -euo pipefail
+          sea_node="$(sed -n 's/^const SEA_NODE_VERSION = "\([0-9.]*\)";$/\1/p' apps/server/vite.config.ts)"
+          if [[ ! "$sea_node" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::Could not read SEA_NODE_VERSION from apps/server/vite.config.ts" >&2
+            exit 1
+          fi
+          VP_NODE_VERSION="$sea_node" node apps/server/scripts/cli.ts build-exe --verbose
+
+      - name: Stage resource monitor for the CLI archive
+        shell: bash
+        run: |
+          set -euo pipefail
+          target_dir="$RUNNER_TEMP/cli-resource-monitor/linux-x64"
+          mkdir -p "$target_dir"
+          cp native/resource-monitor/target/x86_64-unknown-linux-gnu/release/t3-resource-monitor "$target_dir/"
+
+      - name: Build CLI archive
+        run: |
+          node scripts/build-cli-archive.ts \
+            --platform linux \
+            --arch x64 \
+            --version "$VERSION" \
+            --resource-monitor-dir "$RUNNER_TEMP/cli-resource-monitor" \
+            --output-dir release-cli
+
+      - name: Smoke-test CLI archive
+        run: node scripts/smoke-cli-archive.ts --archive release-cli/* --expect-version "$VERSION"
+
+      - name: Upload CLI archive
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: cli-linux-x64
+          path: release-cli/*
+          if-no-files-found: error
+
+  windows_desktop:
+    name: Build Windows x64 desktop
+    needs: [prepare, linux_cli]
+    if: needs.prepare.outputs.status == 'build' && needs.linux_cli.result == 'success'
+    runs-on: windows-2025
+    timeout-minutes: 75
+    permissions:
+      contents: read
+    defaults:
+      run:
+        shell: bash
+    env:
+      VERSION: ${{ needs.prepare.outputs.version }}
+      T3CODE_CLERK_PUBLISHABLE_KEY: ${{ needs.prepare.outputs.clerk_publishable_key }}
+      T3CODE_CLERK_JWT_TEMPLATE: ${{ needs.prepare.outputs.clerk_jwt_template }}
+      T3CODE_CLERK_CLI_OAUTH_CLIENT_ID: ${{ needs.prepare.outputs.clerk_cli_oauth_client_id }}
+      T3CODE_RELAY_URL: ${{ needs.prepare.outputs.relay_url }}
+      # electron-builder's GitHub feed (scripts/build-desktop-artifact.ts,
+      # resolveGitHubPublishConfig). GITHUB_REPOSITORY already names the fork;
+      # this makes it explicit. A nightly version selects channel "nightly".
+      T3CODE_DESKTOP_UPDATE_REPOSITORY: ${{ github.repository }}
+    steps:
+      - name: Download composed tree
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: fork-compose
+          path: ${{ runner.temp }}/fork-compose
+
+      - name: Check out composed tree
+        env:
+          UPSTREAM_SHA: ${{ needs.prepare.outputs.upstream_sha }}
+          TREE: ${{ needs.prepare.outputs.tree }}
+        run: |
+          set -euo pipefail
+          git init -q .
+          git remote add upstream "$UPSTREAM_URL"
+          git fetch --quiet --no-tags --depth=1 upstream "$UPSTREAM_SHA"
+          git sparse-checkout set --no-cone '/*' '!/.repos/'
+          git -c checkout.workers=0 -c advice.detachedHead=false checkout --detach FETCH_HEAD
+          bash "$RUNNER_TEMP/fork-compose/compose.sh" apply "$UPSTREAM_SHA" "$RUNNER_TEMP/fork-compose/composed.patch" "$TREE"
+
+      - name: Setup Vite+
+        uses: voidzero-dev/setup-vp@250f29ce396baf5e8f24498e17c0dfdebabc26eb # v1
+        with:
+          node-version-file: package.json
+          cache: false
+          run-install: false
+
+      - name: Install desktop dependencies
+        run: vp install --filter=@t3tools/desktop... --filter=t3... --filter=@t3tools/scripts...
+
+      - name: Cache resource monitor
+        id: resource_monitor_cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+        with:
+          path: native/resource-monitor/target/x86_64-pc-windows-msvc/release/t3-resource-monitor.exe
+          key: resource-monitor-x86_64-pc-windows-msvc-${{ hashFiles('native/resource-monitor/Cargo.lock', 'native/resource-monitor/Cargo.toml', 'native/resource-monitor/src/**') }}
+
+      - name: Setup Rust
+        if: steps.resource_monitor_cache.outputs.cache-hit != 'true'
+        uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+        with:
+          toolchain: stable
+          targets: x86_64-pc-windows-msvc
+
+      - name: Align package versions to release version
+        run: node scripts/update-release-package-versions.ts "$VERSION"
+
+      - name: Download JS bundle
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: js-bundle
+          path: apps
+
+      # Only the resource monitor build needs these libraries (as upstream).
+      - name: Install Spectre-mitigated MSVC libs
+        if: steps.resource_monitor_cache.outputs.cache-hit != 'true'
+        shell: pwsh
+        run: |
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          $installPath = & $vswhere -products * -latest -property installationPath
+          $setupExe = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\setup.exe"
+          $proc = Start-Process -FilePath $setupExe `
+            -ArgumentList "modify", "--installPath", "`"$installPath`"", "--add", `
+            "Microsoft.VisualStudio.Component.VC.Runtimes.x86.x64.Spectre", "--quiet", "--norestart" `
+            -Wait -PassThru -NoNewWindow
+          if ($null -eq $proc -or $proc.ExitCode -ne 0) {
+            $code = if ($null -ne $proc) { $proc.ExitCode } else { 1 }
+            Write-Error "Visual Studio Installer failed with exit code $code"
+            exit $code
+          }
+
+      # The WSL backend runs the Linux CLI archive inside the distro, so the
+      # Windows app embeds the same archive this release attaches.
+      - name: Download Linux CLI archive for WSL
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: cli-linux-x64
+          path: wsl-runtime
+
+      # Unsigned: the fork has no signing secrets.
+      - name: Build desktop artifact
+        env:
+          T3CODE_DESKTOP_REUSE_RESOURCE_MONITOR: ${{ steps.resource_monitor_cache.outputs.cache-hit == 'true' }}
+        run: |
+          vp run dist:desktop:artifact \
+            --platform win \
+            --target nsis \
+            --arch x64 \
+            --build-version "$VERSION" \
+            --skip-build \
+            --verbose \
+            --wsl-runtime "$GITHUB_WORKSPACE"/wsl-runtime/t3-*-linux-x64.tar.gz
+
+      # The installed app reads resources/app-update.yml to find its feed;
+      # check the copy inside the installer, and the feed manifest beside it.
+      - name: Verify the update feed points at the fork
+        run: |
+          set -euo pipefail
+          owner="${GITHUB_REPOSITORY%%/*}"
+          repo="${GITHUB_REPOSITORY#*/}"
+          shopt -s nullglob
+          installers=(release/*.exe)
+          if [[ ${#installers[@]} -ne 1 ]]; then
+            echo "::error::Expected one installer in release/, found ${#installers[@]}" >&2
+            exit 1
+          fi
+          if [[ ! -f release/nightly.yml ]]; then
+            echo "::error::release/nightly.yml is missing; the build has no nightly update feed" >&2
+            exit 1
+          fi
+          if ! tr -d '\r' < release/nightly.yml | grep -Eqx "version: ['\"]?${VERSION}['\"]?"; then
+            echo "::error::release/nightly.yml does not describe version $VERSION" >&2
+            cat release/nightly.yml
+            exit 1
+          fi
+
+          sevenzip="$(command -v 7z || echo "/c/Program Files/7-Zip/7z.exe")"
+          rm -rf installer-check
+          "$sevenzip" x -y -bso0 -bsp0 -oinstaller-check/nsis "${installers[0]}"
+          payload="$(find installer-check/nsis -name 'app-*.7z' | head -n 1)"
+          "$sevenzip" x -y -bso0 -bsp0 -oinstaller-check/app "$payload" app-update.yml -r
+          config="$(find installer-check/app -name app-update.yml | head -n 1)"
+          tr -d '\r' < "$config" > installer-check/app-update.yml
+          cat installer-check/app-update.yml
+          for line in "provider: github" "owner: $owner" "repo: $repo" "channel: nightly"; do
+            if ! grep -Eqx "${line%%: *}: ['\"]?${line#*: }['\"]?" installer-check/app-update.yml; then
+              echo "::error::app-update.yml lacks '$line'" >&2
+              exit 1
+            fi
+          done
+          rm -rf installer-check
+
+      - name: Collect release assets
+        run: |
+          set -euo pipefail
+          mkdir -p release-publish
+          cp release/*.exe release/*.blockmap release/nightly.yml release-publish/
+          ls -la release-publish
+
+      - name: Upload desktop artifacts
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: desktop-win-x64
+          path: release-publish/*
+          if-no-files-found: error
+
+  publish:
+    name: Publish fork prerelease
+    needs: [prepare, linux_cli, windows_desktop]
+    if: needs.prepare.outputs.status == 'build' && needs.linux_cli.result == 'success' && needs.windows_desktop.result == 'success'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      VERSION: ${{ needs.prepare.outputs.version }}
+      PATCH_SHA: ${{ needs.prepare.outputs.patch_sha }}
+    steps:
+      - name: Download release notes
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: fork-compose
+          path: fork-compose
+
+      - name: Download CLI archive
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: cli-linux-x64
+          path: release-assets
+
+      - name: Download desktop artifacts
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: desktop-win-x64
+          path: release-assets
+
+      # Same file upstream writes (sha256sum over the CLI archives); installers
+      # verify the archive against it (apps/server/src/cloud/pinnedRuntime.ts).
+      - name: Write CLI archive checksums
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd release-assets
+          shopt -s nullglob
+          archives=(t3-*.tar.gz t3-*.zip)
+          if [[ ${#archives[@]} -eq 0 ]]; then
+            echo "No CLI archives were produced." >&2
+            exit 1
+          fi
+          sha256sum "${archives[@]}" > SHA256SUMS
+          cat SHA256SUMS
+
+      - name: Check release assets
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd release-assets
+          for file in "t3-${VERSION}-linux-x64.tar.gz" "T3-Code-${VERSION}-x64.exe" "T3-Code-${VERSION}-x64.exe.blockmap" nightly.yml SHA256SUMS; do
+            if [[ ! -f "$file" ]]; then
+              echo "::error::Missing release asset $file" >&2
+              ls -la
+              exit 1
+            fi
+          done
+          ls -la
+
+      # Created as a draft so a failed upload never leaves a published release
+      # without its assets; publishing creates the tag on the Boat commit.
+      - id: create
+        name: Create prerelease
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag="v$VERSION"
+          if gh release view "$tag" >/dev/null 2>&1; then
+            echo "::error::Release $tag already exists." >&2
+            exit 1
+          fi
+          gh release create "$tag" release-assets/* \
+            --draft \
+            --prerelease \
+            --target "$PATCH_SHA" \
+            --title "T3 Code (Boat fork) $tag" \
+            --notes-file fork-compose/notes.md
+          gh release edit "$tag" --draft=false --prerelease
+          echo "Published $tag."
+
+      - name: Remove unpublished draft
+        if: failure() && steps.create.outcome == 'failure'
+        shell: bash
+        run: |
+          tag="v$VERSION"
+          if [[ "$(gh release view "$tag" --json isDraft --jq .isDraft 2>/dev/null)" == "true" ]]; then
+            gh release delete "$tag" --yes
+          fi
+
+      - name: Prune old fork releases
+        shell: bash
+        run: |
+          set -euo pipefail
+          gh release list --limit 1000 --json tagName,createdAt,isDraft \
+            --jq '[.[] | select(.isDraft | not) | select(.tagName | test("^v[^-+]+-nightly\\.[0-9]{8}\\.[0-9]+$"))] | sort_by(.createdAt) | reverse | .[7:] | .[].tagName' \
+            | while read -r tag; do
+                echo "Deleting $tag"
+                gh release delete "$tag" --yes --cleanup-tag
+              done
