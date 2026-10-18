@@ -153,7 +153,7 @@ const layerDesktopFoundation = Layer.mergeAll(
   DesktopRendererHistory.layer,
 ).pipe(Layer.provideMerge(layerDesktopEnvironment));
 
-const layerDesktopSsh = DesktopBoatSsh.withBoat(layerDesktopSshEnvironment).pipe(
+const layerDesktopSsh = DesktopBoatSsh.layerWithBoat(layerDesktopSshEnvironment).pipe(
   Layer.provideMerge(DesktopSshPasswordPrompts.layer()),
 );
 

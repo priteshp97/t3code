@@ -124,3 +124,19 @@ set `UPSTREAM_TAG_NS=refs/tags`.
   fork's releases.
 - This fork does not publish the npm launcher, AUR package, hosted web app or
   Android APK.
+
+## Boat VM setup snapshot
+
+New Boat VMs start from the named Boat snapshot `t3code` (the default in the
+desktop app's Boat form). `fork/boat-vm-setup.sh` installs the coding setup on a
+fresh VM: Node LTS, pnpm, GitHub CLI, Claude Code, Codex, the Vercel and Supabase
+CLIs, and agent-browser with its browser. It writes no credentials; Boat delivers
+GitHub and agent sign-ins on every start through the account's environment.
+
+To rebuild the snapshot (a VM runs for a couple of minutes, then stops):
+
+    node fork/boat-template.ts --setup fork/boat-vm-setup.sh --snapshot t3code
+
+The script reads a Boat API key from `BOAT_API_KEY` or
+`~/.secrets/t3code-boat/api-key`. It needs sandbox create, read, update, stop and
+resume, ssh, and snapshot read and write. Never commit the key.
