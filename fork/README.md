@@ -15,9 +15,13 @@ No upstream file is edited in Git, so the patch cherry-picks cleanly each day.
 
 ## The daily build
 
-`.github/workflows/fork-nightly.yml` runs at 05:30 UTC and on demand
+`.github/workflows/fork-nightly.yml` polls every 30 minutes and runs on demand
 (`workflow_dispatch`, with an optional upstream tag and a `force` switch). It only
-runs in `priteshp97/t3code`.
+runs in `priteshp97/t3code`. Upstream publishes a nightly whenever `main` has moved
+and 6 hours have passed, usually 3-4 times a day, so a short `check` job compares
+the newest upstream nightly tag and the `boat` head with the newest fork release
+and stops in seconds when nothing changed. It also re-enables the workflow, since
+GitHub switches off schedules in public repos after 60 days without commits.
 
 1. **prepare** fetches `boat` and upstream (`main` and all tags, without file
    contents) and picks the newest upstream `v*-nightly.*` tag, by date and then run
