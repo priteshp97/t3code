@@ -285,7 +285,7 @@ jobs:
               echo "- \`$sha\` $(git log -1 --format=%s "$sha")"
             done < "$out/patch-commits.txt"
             echo
-            echo "The tag points at the \`$PATCH_BRANCH\` commit above; the built tree itself is not pushed. CLI downloads are pointed at \`$GITHUB_REPOSITORY\`. Builds are not code-signed."
+            echo "The tag points at the \`$PATCH_BRANCH\` head when it was published; the build used the \`$PATCH_BRANCH\` commit above. The built tree itself is not pushed. CLI downloads are pointed at \`$GITHUB_REPOSITORY\`. Builds are not code-signed."
             echo
             echo "<!-- fork-upstream-tag: $UPSTREAM_TAG -->"
             echo "<!-- fork-upstream-sha: $UPSTREAM_SHA -->"
@@ -740,7 +740,9 @@ jobs:
           ls -la
 
       # Created as a draft so a failed upload never leaves a published release
-      # without its assets; publishing creates the tag on the Boat commit.
+      # without its assets. The tag goes on the branch head, not the built commit:
+      # GITHUB_TOKEN may not create a ref whose workflow files differ from the
+      # default branch, and an older `boat` commit can.
       - id: create
         name: Create prerelease
         shell: bash
@@ -754,7 +756,7 @@ jobs:
           gh release create "$tag" release-assets/* \
             --draft \
             --prerelease \
-            --target "$PATCH_SHA" \
+            --target "$PATCH_BRANCH" \
             --title "T3 Code (Boat fork) $tag" \
             --notes-file fork-compose/notes.md
           gh release edit "$tag" --draft=false --prerelease
