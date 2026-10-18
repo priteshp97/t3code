@@ -1,3 +1,10 @@
+import type {
+  DesktopBoatCreateVmInput,
+  DesktopBoatRemoveVmInput,
+  DesktopBoatSettings,
+  DesktopBoatSettingsUpdate,
+  DesktopBoatVm,
+} from "./desktopBoat.ts";
 import * as Schema from "effect/Schema";
 
 import { SnapShotSource } from "./chatAttachment.ts";
@@ -1085,6 +1092,11 @@ export interface DesktopBridge {
   ) => Promise<AuthWebSocketTicketResult>;
   onSshPasswordPrompt: (listener: (request: DesktopSshPasswordPromptRequest) => void) => () => void;
   resolveSshPasswordPrompt: (requestId: string, password: string | null) => Promise<void>;
+  /** Boat.dev VMs; absent on desktop builds without the Boat fork patch. */
+  getBoatSettings?: () => Promise<DesktopBoatSettings>;
+  updateBoatSettings?: (update: DesktopBoatSettingsUpdate) => Promise<DesktopBoatSettings>;
+  createBoatVm?: (input: DesktopBoatCreateVmInput) => Promise<DesktopBoatVm>;
+  removeBoatVm?: (input: DesktopBoatRemoveVmInput) => Promise<void>;
   getServerExposureState: () => Promise<DesktopServerExposureState>;
   setServerExposureMode: (mode: DesktopServerExposureMode) => Promise<DesktopServerExposureState>;
   setTailscaleServeEnabled: (input: {

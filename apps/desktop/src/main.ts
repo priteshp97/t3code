@@ -22,6 +22,7 @@ import * as HostProcess from "@t3tools/shared/HostProcess";
 import type { RemoteT3RunnerOptions } from "@t3tools/ssh/tunnel";
 import serverPackageJson from "../../server/package.json" with { type: "json" };
 
+import * as DesktopBoatSsh from "./boat/DesktopBoatSsh.ts";
 import * as DesktopIpc from "./ipc/DesktopIpc.ts";
 import * as ElectronApp from "./electron/ElectronApp.ts";
 import * as ElectronDialog from "./electron/ElectronDialog.ts";
@@ -152,7 +153,7 @@ const layerDesktopFoundation = Layer.mergeAll(
   DesktopRendererHistory.layer,
 ).pipe(Layer.provideMerge(layerDesktopEnvironment));
 
-const layerDesktopSsh = layerDesktopSshEnvironment.pipe(
+const layerDesktopSsh = DesktopBoatSsh.withBoat(layerDesktopSshEnvironment).pipe(
   Layer.provideMerge(DesktopSshPasswordPrompts.layer()),
 );
 

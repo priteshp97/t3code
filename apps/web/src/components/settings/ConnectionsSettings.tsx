@@ -8,6 +8,7 @@ import {
   QrCodeIcon,
   RouteIcon,
   TerminalIcon,
+  CloudIcon,
 } from "lucide-react";
 import { useAtomValue } from "@effect/atom-react";
 import {
@@ -175,6 +176,12 @@ import {
 } from "~/state/desktopNetworkAccess";
 import { desktopSshHostsStateAtom, filterDiscoveredSshHosts } from "~/state/desktopSshHosts";
 import { desktopWslStateAtom, refreshDesktopWslState } from "~/state/desktopWslState";
+import {
+  BoatEnvironmentFields,
+  boatSshTargetOf,
+  isBoatVmSupported,
+  stopBoatVmFor,
+} from "./BoatEnvironmentFields";
 import {
   type EnvironmentPresentation,
   useEnvironments,
@@ -2112,7 +2119,7 @@ export function ConnectionsSettings() {
   const [isRevokingOtherDesktopClients, setIsRevokingOtherDesktopClients] = useState(false);
   const [addBackendDialogOpen, setAddBackendDialogOpen] = useState(false);
   const [routeTarget, setRouteTarget] = useState<EnvironmentPresentation | null>(null);
-  const [savedBackendMode, setSavedBackendMode] = useState<"remote" | "ssh">("remote");
+  const [savedBackendMode, setSavedBackendMode] = useState<"remote" | "ssh" | "boat">("remote");
   const [savedBackendHost, setSavedBackendHost] = useState("");
   const [savedBackendPairingCode, setSavedBackendPairingCode] = useState("");
   const [savedBackendSshHost, setSavedBackendSshHost] = useState("");
@@ -2458,12 +2465,12 @@ export function ConnectionsSettings() {
     setIsRevokingOtherDesktopClients(false);
   };
 
-  const connectSavedBackendSshTarget = async (target: DesktopSshEnvironmentTarget) => {
+  const connectSavedBackendSshTarget = async (target: DesktopSshEnvironmentTarget, label = "") => {
     setIsAddingSavedBackend(true);
     setSavedBackendError(null);
     const result = await connectSshEnvironment({
       target,
-      label: "",
+      label,
       ...(routeTarget ? { expectedEnvironmentId: routeTarget.environmentId } : {}),
     });
     if (result._tag === "Failure") {
@@ -2664,6 +2671,17 @@ export function ConnectionsSettings() {
     setRemovingSavedEnvironmentId(environmentId);
     setSavedBackendError(null);
     const result = await removeEnvironment(environmentId);
+    if (result._tag === "Success") {
+      await stopBoatVmFor(environment).catch((error: unknown) => {
+        toastManager.add(
+          stackedThreadToast({
+            type: "error",
+            title: "Could not stop the Boat VM",
+            description: error instanceof Error ? error.message : "Stop it from boat.dev instead.",
+          }),
+        );
+      });
+    }
     setRemovingSavedEnvironmentId(null);
     if (result._tag === "Failure" && !isAtomCommandInterrupted(result)) {
       const error = squashAtomCommandFailure(result);
@@ -2689,7 +2707,9 @@ export function ConnectionsSettings() {
       return;
     }
     const confirmed = await requestConfirmDialog(
-      `Remove ${environment.label} from this device?\nThis forgets its pairing, credentials, and cached threads here. Switch it off instead to keep it saved.`,
+      boatSshTargetOf(environment)
+        ? `Remove ${environment.label} and stop its Boat VM?\nBoat deletes a stopped VM's disk after 14 days, so push any work you want to keep first.`
+        : `Remove ${environment.label} from this device?\nThis forgets its pairing, credentials, and cached threads here. Switch it off instead to keep it saved.`,
       { variant: "destructive" },
     );
     if (confirmed === true) await removeSavedBackend(environment);
@@ -2730,7 +2750,7 @@ export function ConnectionsSettings() {
   };
 
   const renderConnectionModeCard = (input: {
-    readonly mode: "remote" | "ssh";
+    readonly mode: "remote" | "ssh" | "boat";
     readonly title: string;
     readonly description: string;
     readonly icon?: ReactNode;
@@ -3901,9 +3921,27 @@ export function ConnectionsSettings() {
                             icon: <TerminalIcon aria-hidden className="size-4" />,
                           })
                         : null}
+                      {!routeTarget && isBoatVmSupported()
+                        ? renderConnectionModeCard({
+                            mode: "boat",
+                            title: "Boat.dev VM",
+                            description: "Start a cloud VM on boat.dev and run T3 Code there.",
+                            icon: <CloudIcon aria-hidden className="size-4" />,
+                          })
+                        : null}
                     </div>
                     <AnimatedHeight>
-                      {savedBackendMode === "ssh" ? renderSshFields() : renderRemoteModeBody()}
+                      {savedBackendMode === "boat" && !routeTarget ? (
+                        <BoatEnvironmentFields
+                          disabled={isAddingSavedBackend}
+                          error={savedBackendError}
+                          onCreated={(vm) => connectSavedBackendSshTarget(vm.target, vm.label)}
+                        />
+                      ) : savedBackendMode === "ssh" ? (
+                        renderSshFields()
+                      ) : (
+                        renderRemoteModeBody()
+                      )}
                     </AnimatedHeight>
                   </div>
                 </DialogPanel>

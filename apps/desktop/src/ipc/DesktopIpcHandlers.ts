@@ -31,6 +31,12 @@ import {
   resolveSshPasswordPrompt,
 } from "./methods/sshEnvironment.ts";
 import {
+  createBoatVm,
+  getBoatSettings,
+  removeBoatVm,
+  updateBoatSettings,
+} from "./methods/boatEnvironment.ts";
+import {
   checkForUpdate,
   downloadUpdate,
   getUpdateState,
@@ -128,6 +134,10 @@ export const installDesktopIpcHandlers = Effect.fn("desktop.ipc.installHandlers"
   yield* ipc.handle(fetchSshSessionState);
   yield* ipc.handle(issueSshWebSocketTicket);
   yield* ipc.handle(resolveSshPasswordPrompt);
+  yield* ipc.handle(getBoatSettings);
+  yield* ipc.handle(updateBoatSettings);
+  yield* ipc.handle(createBoatVm);
+  yield* ipc.handle(removeBoatVm);
 
   yield* ipc.handle(getServerExposureState);
   yield* ipc.handle(setServerExposureMode);
