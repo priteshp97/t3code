@@ -10,7 +10,7 @@ import { afterEach, beforeEach, describe, expect, it } from "vite-plus/test";
 
 import {
   BOAT_ACTIVE_RUN_STATUSES,
-  boatKeepAwakeInstallScript,
+  boatVmSetupScript,
   boatKeepAwakeScript,
 } from "./boatKeepAwake.ts";
 
@@ -83,10 +83,33 @@ describe("Boat keep-awake helper", () => {
     expect(BOAT_ACTIVE_RUN_STATUSES).not.toContain("completed");
   });
 
-  it("is a valid shell script that installs the helper verbatim", () => {
-    const install = boatKeepAwakeInstallScript(900);
-    NodeChildProcess.execFileSync("bash", ["-n"], { input: install });
-    expect(install).toContain(boatKeepAwakeScript());
-    expect(install).toContain("Environment=T3_BOAT_GRACE_SECONDS=900");
+  it("writes valid setup scripts with and without the T3 server service", () => {
+    const withServer = boatVmSetupScript({
+      graceSeconds: 900,
+      server: {
+        version: "0.1.1-nightly.20261018.333501",
+        releaseBaseUrl: "https://github.com/example/t3code/releases/download/",
+      },
+    });
+    const helperOnly = boatVmSetupScript({ graceSeconds: 900, server: null });
+    for (const script of [withServer, helperOnly]) {
+      NodeChildProcess.execFileSync("bash", ["-n"], { input: script });
+      expect(script).toContain(boatKeepAwakeScript());
+      expect(script).toContain("Environment=T3_BOAT_GRACE_SECONDS=900");
+    }
+    expect(withServer).toContain("base='https://github.com/example/t3code/releases/download'");
+    expect(helperOnly).not.toContain("t3code-boat-server.service");
+  });
+
+  it("reports unfinished work through --check for deferring T3 updates", () => {
+    seedRuns([{ status: "running" }]);
+    const script = NodePath.join(dir, "keep-awake.mjs");
+    NodeFS.writeFileSync(script, boatKeepAwakeScript());
+    const check = (db: string) =>
+      NodeChildProcess.spawnSync(process.execPath, [script, "--check"], {
+        env: { ...process.env, T3_BOAT_STATE_DB: db },
+      }).status;
+    expect(check(NodePath.join(dir, "state.sqlite"))).toBe(0);
+    expect(check(NodePath.join(dir, "missing.sqlite"))).toBe(1);
   });
 });

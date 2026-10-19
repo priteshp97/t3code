@@ -25,7 +25,8 @@ import * as Schema from "effect/Schema";
 import * as DesktopEnvironment from "../app/DesktopEnvironment.ts";
 import * as ElectronSafeStorage from "../electron/ElectronSafeStorage.ts";
 import { type BoatSshAccess, ensureBoatSandboxRunning, makeBoatClient } from "./boatApi.ts";
-import { boatKeepAwakeInstallScript } from "./boatKeepAwake.ts";
+import { cliReleaseDownloadBaseUrl } from "@t3tools/shared/cliRelease";
+import { boatVmSetupScript } from "./boatKeepAwake.ts";
 import {
   BOAT_SSH_DIR_NAME,
   boatAliasForSandbox,
@@ -222,8 +223,14 @@ export const make = Effect.gen(function* () {
     return (await NodeFSP.readFile(publicKeyPath, "utf8")).trim();
   };
 
-  /** Installs the on-VM helper that keeps the VM awake while agent runs are unfinished. */
-  const installKeepAwake = (sandboxId: string, idleMinutes: number) =>
+  // Fork builds point the CLI release repo at the fork, so this follows the app's own releases.
+  const releaseBaseUrl = cliReleaseDownloadBaseUrl("").replace(/\/v$/u, "");
+
+  /**
+   * Installs the T3 server service (this app's version) and the keep-awake helper.
+   * Dev builds have no release archive, so the SSH path launches their server.
+   */
+  const setUpVm = (sandboxId: string, idleMinutes: number) =>
     new Promise<void>((resolve) => {
       const child = NodeChildProcess.spawn(
         "ssh",
@@ -235,17 +242,25 @@ export const make = Effect.gen(function* () {
         stderr += chunk.toString();
       });
       child.on("error", (error) => {
-        console.warn(`Boat keep-awake helper not installed on ${sandboxId}: ${error.message}`);
+        console.warn(`Boat VM services not set up on ${sandboxId}: ${error.message}`);
         resolve();
       });
       child.on("close", (code) => {
-        // Without the helper the VM still stops on its idle timer; it just cannot outlive the app.
+        // Without the services the SSH path still launches T3 and the VM still stops on its
+        // idle timer; work just cannot outlive the app.
         if (code !== 0) {
-          console.warn(`Boat keep-awake helper not installed on ${sandboxId}: ${stderr.trim()}`);
+          console.warn(`Boat VM services not set up on ${sandboxId}: ${stderr.trim()}`);
         }
         resolve();
       });
-      child.stdin.end(boatKeepAwakeInstallScript(idleMinutes * 60));
+      child.stdin.end(
+        boatVmSetupScript({
+          graceSeconds: idleMinutes * 60,
+          server: environment.isDevelopment
+            ? null
+            : { version: environment.appVersion, releaseBaseUrl },
+        }),
+      );
     });
 
   /** Starts the VM, registers our key and pins its current address and host key. */
@@ -270,7 +285,7 @@ export const make = Effect.gen(function* () {
       return [{ ...state, vms }, undefined];
     });
     await waitForTcpPort(ssh.hostname, ssh.port, SSH_PORT_WAIT_MS);
-    await installKeepAwake(sandboxId, idleMinutes);
+    await setUpVm(sandboxId, idleMinutes);
     return ssh;
   };
 
